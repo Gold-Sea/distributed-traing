@@ -1,0 +1,10 @@
+checkpoints/
+logs/
+timelines/
+.vscode/
+__pycache__/
+data/
+.python-version
+utils/*.pdf
+utils/*.gv
+.idea/
