@@ -1,4 +1,3 @@
-
 from __future__ import print_function
 
 import torch
@@ -17,6 +16,10 @@ import json
 import time
 import numpy as np
 
+def sync_e():
+    e = torch.cuda.Event()
+    e.record()
+    e.synchronize()
 # Training settings
 parser = argparse.ArgumentParser(description='PyTorch ImageNet Example',
                                  formatter_class=argparse.ArgumentDefaultsHelpFormatter)
@@ -42,9 +45,7 @@ parser.add_argument('--batch-size', type=int, default=32,
                     help='input batch size for training')
 parser.add_argument('--val-batch-size', type=int, default=32,
                     help='input batch size for validation')
-parser.add_argument('--epochs', type=int, default=1000000000,
-                    help='number of epochs to train')
-parser.add_argument('--iterations', type=int, default=1000000,
+parser.add_argument('--epochs', type=int, default=10,
                     help='number of epochs to train')
 parser.add_argument('--base-lr', type=float, default=0.0125,
                     help='learning rate for a single GPU')
@@ -66,28 +67,28 @@ args.cuda = not args.no_cuda and torch.cuda.is_available()
 allreduce_batch_size = args.batch_size * args.batches_per_allreduce
 
 torch.manual_seed(args.seed)
+torch.cuda.manual_seed_all(args.seed)
 
 step1 = torch.cuda.Event(enable_timing=True)
 step14 = torch.cuda.Event(enable_timing=True)
 
 time_batch = []
 
-step1.record()
+# step1.record()
 
 if args.cuda:
     # Horovod: pin GPU to local rank.
-    # torch.cuda.set_device(0)
+    torch.cuda.set_device(0)
     torch.cuda.manual_seed(args.seed)
-    torch.cuda.manual_seed_all(args.seed)
 
 cudnn.benchmark = True
 
 # If set > 0, will resume training from a given checkpoint.
 resume_from_epoch = 0
-# for try_epoch in range(args.epochs, 0, -1):
-#     if os.path.exists(args.checkpoint_format.format(epoch=try_epoch)):
-#         resume_from_epoch = try_epoch
-#         break
+for try_epoch in range(args.epochs, 0, -1):
+    if os.path.exists(args.checkpoint_format.format(epoch=try_epoch)):
+        resume_from_epoch = try_epoch
+        break
 
 # Horovod: broadcast resume_from_epoch from rank 0 (which will have
 # checkpoints) to other ranks.
@@ -132,7 +133,7 @@ val_dataset = \
                                                   std=[0.229, 0.224, 0.225])
                          ]))
 val_sampler = torch.utils.data.distributed.DistributedSampler(
-    val_dataset, num_replicas=1, rank=0, shuffle=False)
+    val_dataset, num_replicas=1, rank=0)
 val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=args.val_batch_size,
                                          sampler=val_sampler, **kwargs)
 
@@ -173,44 +174,69 @@ if resume_from_epoch > 0:
 # hvd.broadcast_optimizer_state(optimizer, root_rank=0)
 
 def train(epoch):
+    global now
     model.train()
     train_sampler.set_epoch(epoch)
     train_loss = Metric('train_loss')
     train_accuracy = Metric('train_accuracy')
-
+    now = time.time()
     with tqdm(total=len(train_loader),
               desc='Train Epoch     #{}'.format(epoch + 1),
               disable=not verbose) as t:
+        cnt = 0
         for batch_idx, (data, target) in enumerate(train_loader):
+            if cnt % 100 ==0 and cnt !=0:
+                sync_e()
+                last = now
+                now = time.time()
+                duration = now - last
+                print('gaptime %lf ' % duration)
+            cnt += 1
             adjust_learning_rate(epoch, batch_idx)
             # number of batchs limit
-            if batch_idx >= args.iterations:
-                args.iterations -= batch_idx
+            if batch_idx >= 30000:
                 return
 
             if args.cuda:
-                data, target = data.cuda(), target.cuda()
+                with log_time(model_logger, "batch-data-tocuda", 0):
+                    data, target = data.cuda(), target.cuda()
             optimizer.zero_grad()
+
             # Split data into sub-batches of size batch_size
             for i in range(0, len(data), args.batch_size):
                 data_batch = data[i:i + args.batch_size]
                 target_batch = target[i:i + args.batch_size]
                 # sync_e()
+                lobj = {"ph": "X", "name": "foward", "ts": time.time(), "pid": 0, "dur": 0}
                 output = model(data_batch)
                 # sync_e()
+                lobj["dur"]=time.time()-lobj["ts"]
+                model_logger.info(json.dumps(lobj))
 
-                _acc = accuracy(output, target_batch)
-                train_accuracy.update(_acc)
-                loss = F.cross_entropy(output, target_batch)
-                train_loss.update(loss)
+                lobj = {"ph": "X", "name": "compute-loss", "ts": time.time(), "pid": 0, "dur": 0}
+                with log_time(model_logger, "horovod-acc-comp", 0):
+                    _acc = accuracy(output, target_batch)
+                with log_time(model_logger, "horovod-acc-update", 0):
+                    train_accuracy.update(_acc)
+                with log_time(model_logger, "torch-loss-comp", 0):
+                    loss = F.cross_entropy(output, target_batch)
+                with log_time(model_logger, "horovod-loss-update", 0):
+                    train_loss.update(loss)
                 # Average gradients among sub-batches
-                loss.div_(math.ceil(float(len(data)) / args.batch_size))
+                with log_time(model_logger, "avg-sub-batches-loss", 0):
+                    loss.div_(math.ceil(float(len(data)) / args.batch_size))
+                lobj["dur"]=time.time()-lobj["ts"]
+                model_logger.info(json.dumps(lobj))
 
                 # sync_e()
+                lobj = {"ph": "X", "name": "backward", "ts": time.time(), "pid": 0, "dur": 0}
                 loss.backward()
                 # sync_e()
+                lobj["dur"]=time.time()-lobj["ts"]
+                model_logger.info(json.dumps(lobj))
 
             # Gradient is applied across all ranks
+            lobj = {"ph": "X", "name": "update-gradients", "ts": time.time(), "pid": 0, "dur": 0}
             optimizer.step()
             # step14.record()
             # torch.cuda.synchronize()
@@ -221,12 +247,12 @@ def train(epoch):
             #     for n, p in model.named_parameters():
             #         print(p, file=file)
             #     assert(False)
+            lobj["dur"]=time.time()-lobj["ts"]
+            model_logger.info(json.dumps(lobj))
 
             t.set_postfix({'loss': train_loss.avg.item(),
                         'accuracy': 100. * train_accuracy.avg.item()})
             t.update(1)
-
-    args.iterations -= len(train_loader)
 
     if log_writer:
         log_writer.add_scalar('train/loss', train_loss.avg, epoch)
@@ -310,8 +336,6 @@ class Metric(object):
 
 lobj = {"ph": "X", "name": "training", "ts": time.time(), "pid": 0, "dur": 0}
 for epoch in range(resume_from_epoch, args.epochs):
-    if args.iterations <= 0:
-        break
     train(epoch)
     # validate(epoch)
     # save_checkpoint(epoch)
