@@ -16,6 +16,12 @@ import json
 import time
 import numpy as np
 
+def sync_e():
+    e = torch.cuda.Event()
+    e.record()
+    e.synchronize()
+
+
 # Training settings
 parser = argparse.ArgumentParser(description='PyTorch ImageNet Example',
                                  formatter_class=argparse.ArgumentDefaultsHelpFormatter)
@@ -105,7 +111,7 @@ kwargs = {'num_workers': 4, 'pin_memory': True} if args.cuda else {}
 train_dataset = \
     datasets.ImageFolder(args.train_dir,
                          transform=transforms.Compose([
-                             transforms.RandomResizedCrop(299),
+                             transforms.RandomResizedCrop(224),
                              transforms.RandomHorizontalFlip(),
                              transforms.ToTensor(),
                              transforms.Normalize(mean=[0.485, 0.456, 0.406],
@@ -169,21 +175,28 @@ if resume_from_epoch > 0:
 # hvd.broadcast_parameters(model.state_dict(), root_rank=0)
 # hvd.broadcast_optimizer_state(optimizer, root_rank=0)
 
-
-
 def train(epoch):
+    global now
     model.train()
     train_sampler.set_epoch(epoch)
     train_loss = Metric('train_loss')
     train_accuracy = Metric('train_accuracy')
-
+    now = time.time()
     with tqdm(total=len(train_loader),
               desc='Train Epoch     #{}'.format(epoch + 1),
               disable=not verbose) as t:
+        cnt = 0
         for batch_idx, (data, target) in enumerate(train_loader):
+            if cnt % 100 ==0 and cnt !=0:
+                sync_e()
+                last = now
+                now = time.time()
+                duration = now - last
+                print('gaptime %lf ' % duration)
+            cnt += 1
             adjust_learning_rate(epoch, batch_idx)
             # number of batchs limit
-            if batch_idx >= 3000:
+            if batch_idx >= 30000:
                 return
 
             if args.cuda:
@@ -196,14 +209,14 @@ def train(epoch):
                 target_batch = target[i:i + args.batch_size]
                 # sync_e()
                 lobj = {"ph": "X", "name": "foward", "ts": time.time(), "pid": 0, "dur": 0}
-                output = model(data_batch).logits
+                output = model(data_batch)
                 # sync_e()
                 lobj["dur"]=time.time()-lobj["ts"]
                 model_logger.info(json.dumps(lobj))
 
                 lobj = {"ph": "X", "name": "compute-loss", "ts": time.time(), "pid": 0, "dur": 0}
                 with log_time(model_logger, "horovod-acc-comp", 0):
-                    _acc = accuracy(output, target_batch)
+                    _acc = 0
                 with log_time(model_logger, "horovod-acc-update", 0):
                     train_accuracy.update(_acc)
                 with log_time(model_logger, "torch-loss-comp", 0):
@@ -226,8 +239,10 @@ def train(epoch):
             # Gradient is applied across all ranks
             lobj = {"ph": "X", "name": "update-gradients", "ts": time.time(), "pid": 0, "dur": 0}
             optimizer.step()
+            # step14.record()
+            # torch.cuda.synchronize()
             # time_batch.append(step14.elapsed_time(step1))
-            #  step1.record()
+            # step1.record()
             # if batch_idx == 3:
             #     file = open("correct.log", "w")
             #     for n, p in model.named_parameters():
@@ -260,7 +275,7 @@ def validate(epoch):
                 output = model(data)
 
                 val_loss.update(F.cross_entropy(output, target))
-                val_accuracy.update(accuracy(output, target))
+                val_accuracy.update()
                 t.set_postfix({'loss': val_loss.avg.item(),
                                'accuracy': 100. * val_accuracy.avg.item()})
                 t.update(1)
@@ -326,9 +341,10 @@ for epoch in range(resume_from_epoch, args.epochs):
     # validate(epoch)
     # save_checkpoint(epoch)
 
+lobj["dur"]=time.time()-lobj["ts"]
+model_logger.info(json.dumps(lobj))
+
 step14.record()
 torch.cuda.synchronize()
 
-lobj["dur"]=time.time()-lobj["ts"]
-model_logger.info(json.dumps(lobj))
-print("batch", step1.elapsed_time(step14))
+print("batch", step1.elapsed_time(step14))# np.sum(time_batch[40:]))
